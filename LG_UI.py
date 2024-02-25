@@ -29,12 +29,14 @@ class LG_UI(LG_SCRAP):
         
     
     def start_thread(self,entry):
+        print("crawl started")
         if(self.flag):
             self.flag=False
             self.setup_config(entry.get())
+            frontend = threading.Thread(target=self.update_ui)
             backend = threading.Thread(target=self.get_link)
             backend.start()
-            self.update_ui()
+            frontend.start()
             
 
 
@@ -49,7 +51,7 @@ class LG_UI(LG_SCRAP):
         url_label=customtkinter.CTkLabel(master=home_frame, text="Enter the URL",text_color="#E0E0E0",font=("Arial",15))
         url_label.grid(row=0,column=0,sticky=tk.W,padx=5)
 
-        entry = customtkinter.CTkEntry(master=home_frame, placeholder_text="URL or web address",width=350,height=25)
+        entry = customtkinter.CTkEntry(master=home_frame, placeholder_text="URL or web address",width=350,height=25,fg_color="black",text_color="white")
         entry.grid(row=0,column=1,sticky=tk.W,padx=20)
 
         button = customtkinter.CTkButton(master=self.root, text="Start", command=lambda:self.start_thread(entry),fg_color="green",hover_color="#00c4a0")
@@ -66,13 +68,13 @@ class LG_UI(LG_SCRAP):
             curr_time = self.get_time()
             if 'data_found' in self.data[self.index]:
                 value = curr_time + '\t' +"Success :"+self.data[self.index]['data_found']+'\n\n'
-                self.scrolled_text.insert(tk.END, value)
+                self.scrolled_text.insert(tk.END, str(value))
                 self.index += 1
             elif 'Error' in self.data[self.index] or 'Info' in self.data[self.index]:
-                err_value = curr_time + '\t' +"Warning"+ self.data[self.index]['Error']+'\n\n'
+                err_value = curr_time + '\t' +"Warning :"+ self.data[self.index]['Error']+'\n\n'
                 self.scrolled_text.insert(tk.END, str(err_value))
 
-                inf_value = curr_time + '\t' + "Info"+self.data[self.index+1]['Info']+'\n\n'
+                inf_value = curr_time + '\t' + "Info :"+self.data[self.index+1]['Info']+'\n\n'
                 self.scrolled_text.insert(tk.END, str(inf_value))
                 self.index += 2
         except:

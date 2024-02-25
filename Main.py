@@ -24,43 +24,69 @@ class LG_SCRAP:
         self.start_scrap()
     
     def swap_flag(self):
+        print("process stopped")
         self.flag=True
         
         
         
     def start_scrap(self):
-        if(self.flag):
-            return
-       
-        try:
-            self.driver.execute_script("""
-        var confirmDialog = window.confirm;
-        window.confirm = function(){
-            return true;
-        };
-    """)
-        except:
-            pass
-        try:      
-            element = self.driver.execute_script("""
+        while(True):
+            
+            if(self.flag):
+                break
+        
+            try:
+                self.driver.execute_script("""
+            var confirmDialog = window.confirm;
+            window.confirm = function(){
+                return true;
+            };
+        """)
+            except:
+                pass
+            try:
+                flag=True      
+                element = self.driver.execute_script("""
         return document.getElementsByClassName('GridViewStyle')[0];
     """)
-            if(element):
-                
-                self.driver.execute_script("Array.from(document.querySelectorAll('input[type=checkbox]')).forEach(el => el.checked = true);")
-            
+                if element:
+                    script = """
+    var rows = document.querySelectorAll('.GridViewStyle tr');
+var checkboxesToClick = [];
+var flag = true;
+rows.forEach(function(row) {
+    if (flag) {
+        flag = false;
+        return;
+    }
+    var td12 = row.querySelectorAll('td')[11]; // Get the 12th table data element (index starts from 0)
+    if (td12) { // Check if td12 is not undefined
+        var spanElement = td12.querySelector('span'); // Find the span element within the td12
+        if (spanElement) { // Check if spanElement is not undefined
+            var number = parseInt(spanElement.textContent.replace(',', '')); // Extract the number from the span element
+            if (number < 90000) {
+                var checkboxId = row.querySelector('input[type="checkbox"]').id;
+                checkboxesToClick.push(checkboxId);
+            }
+        }
+    }
+});
+checkboxesToClick.forEach(function(checkboxId) {
+    document.getElementById(checkboxId).click();
+});
+    """
+                    self.driver.execute_script(script)
+
                 self.driver.execute_script("""
-                                            document.getElementById('ContentPlaceHolder1_btnSave').click();
-                                            """)
-                self.data.append({'data_found':'data found'})
+                    document.getElementById('ContentPlaceHolder1_btnSave').click();
+                """)
+                self.data.append({'data_found': 'data found'})
                 print("submitted successfully:)")
-            
-        except:
-            self.driver.refresh()
-            self.data.append({'Error':'No Data Found'})
-            self.data.append({'Info':'Starting to Refresh'})
-            self.start_scrap()
-        self.start_scrap()
+                
+            except Exception as e:
+                self.driver.refresh()
+                self.data.append({'Error':'No Data Found'})
+                self.data.append({'Info':'Starting to Refresh'})
         
         
 
