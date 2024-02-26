@@ -64,7 +64,7 @@ rows.forEach(function(row) {
         var spanElement = td12.querySelector('span'); // Find the span element within the td12
         if (spanElement) { // Check if spanElement is not undefined
             var number = parseInt(spanElement.textContent.replace(',', '')); // Extract the number from the span element
-            if (number < 90000) {
+            if (number >= 40000 && number <= 70000) {
                 var checkboxId = row.querySelector('input[type="checkbox"]').id;
                 checkboxesToClick.push(checkboxId);
             }
