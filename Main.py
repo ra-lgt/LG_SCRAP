@@ -63,11 +63,8 @@ rows.forEach(function(row) {
     if (td12) { // Check if td12 is not undefined
         var spanElement = td12.querySelector('span'); // Find the span element within the td12
         if (spanElement) { // Check if spanElement is not undefined
-            var number = spanElement.textContent.replace(',', ''); // Extract the number from the span element
-            if (number >= '40000' && number <= '70000') {
                 var checkbox = row.querySelector('input[type="checkbox"]');
                 checkboxesToClick.push(checkbox);
-            }
         }
     }
 });
