@@ -44,46 +44,8 @@ class LG_SCRAP:
         """)
             except:
                 pass
-            try:
-                flag=True      
-                element = self.driver.execute_script("""
-        return document.getElementsByClassName('GridViewStyle')[0];
-    """)
-                if element:
-                    script = """
-   var rows = document.querySelectorAll('.GridViewStyle tr');
-var checkboxesToClick = [];
-var flag = true;
-rows.forEach(function(row) {
-    if (flag) {
-        flag = false;
-        return;
-    }
-    var td12 = row.querySelectorAll('td')[11]; // Get the 12th table data element (index starts from 0)
-    if (td12) { // Check if td12 is not undefined
-        var spanElement = td12.querySelector('span'); // Find the span element within the td12
-        if (spanElement) { // Check if spanElement is not undefined
-                var checkbox = row.querySelector('input[type="checkbox"]');
-                checkboxesToClick.push(checkbox);
-        }
-    }
-});
-checkboxesToClick.forEach(function(checkbox) {
-    checkbox.click();
-});
-    """
-                    self.driver.execute_script(script)
+            self.driver.refresh()
 
-                self.driver.execute_script("""
-                    document.getElementById('ContentPlaceHolder1_btnSave').click();
-                """)
-                self.data.append({'data_found': 'data found'})
-                print("submitted successfully:)")
-                
-            except Exception as e:
-                self.driver.refresh()
-                self.data.append({'Error':'No Data Found'})
-                self.data.append({'Info':'Starting to Refresh'})
         
         
 
