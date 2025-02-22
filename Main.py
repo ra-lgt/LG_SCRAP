@@ -13,7 +13,7 @@ class LG_SCRAP:
         self.flag = False
 
     def start_scrap(self):
-        driver = webdriver.Firefox()
+        driver = webdriver.Chrome(options=self.options)
         driver.get(self.url)
         driver.implicitly_wait(20)
 
