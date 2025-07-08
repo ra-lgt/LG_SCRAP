@@ -5,12 +5,14 @@ import threading
 import time
 
 class LG_SCRAP:
-    def __init__(self, url, stop_event):
+    def __init__(self, url, stop_event, min_amount=0, max_amount=0):
         self.url = url
         self.stop_event = stop_event
         self.options = Options()
         self.options.add_argument("--start-maximized")
         self.flag = False
+        self.max_amount = max_amount
+        self.min_amount = min_amount
 
     def start_scrap(self):
         driver = webdriver.Chrome(options=self.options)
@@ -41,10 +43,12 @@ class LG_SCRAP:
                                 flag = false;
                                 return;
                             }
-                            var td12 = row.querySelectorAll('td')[11];
-                            if (td12) {
-                                var spanElement = td12.querySelector('span');
-                                if (spanElement) {
+                            var price = row.querySelectorAll('td')[11];
+                            if (price) {
+                                var spanElement = price.querySelector('span').innerHTML.replace(',','');
+                                spanElement=parseFloat(spanElement);
+                                console.log(spanElement)
+                                if (spanElement && spanElement >= """ + str(self.min_amount) + """ && spanElement <= """ + str(self.max_amount) + """) {
                                     var checkbox = row.querySelector('input[type="checkbox"]');
                                     checkboxesToClick.push(checkbox);
                                 }
@@ -66,15 +70,17 @@ class LG_SCRAP:
 
         driver.quit()  
 
-def run_scraper(url, count):
+def run_scraper(url, count, min_amount, max_amount):
     stop_event = threading.Event()  
     with ThreadPoolExecutor(max_workers=count) as executor:
-        executor.map(lambda _: LG_SCRAP(url, stop_event).start_scrap(), range(count))
+        executor.map(lambda _: LG_SCRAP(url, stop_event, min_amount, max_amount).start_scrap(), range(count))
 
 if __name__ == "__main__":
     url = input("Enter the URL: ")
+    min_amount=input("Enter the minimum amount: ")
+    max_amount=input("Enter the maximum amount: ")
     tab_count = int(input("Enter the number of tabs: "))
-    run_scraper(url, tab_count)
+    run_scraper(url, tab_count, min_amount, max_amount)
 
 
 
