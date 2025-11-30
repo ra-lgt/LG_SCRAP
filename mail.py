@@ -1,45 +1,47 @@
 import imaplib
 import email
 from email.header import decode_header
-from bs4 import BeautifulSoup   # <-- install: pip install beautifulsoup4
+from bs4 import BeautifulSoup
 import re
+
 
 IMAP_SERVER = "imap.gmail.com"
 EMAIL = "asm.electronics.pune@gmail.com"
 PASSWORD = "uxfhzpavjlmmchov"  # Gmail App Password
 
 
+def connect_mail():
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+    mail.login(EMAIL, PASSWORD)
+    mail.select("inbox")
+    return mail
 
-def delete_mail_by_id(mail, msg_id):
+
+def delete_mail_by_id(msg_id):
     """
-    Marks an email as deleted and expunges it from Gmail.
+    Deletes email safely.
     """
     try:
-        # Mark email as deleted
+        mail = connect_mail()
         mail.store(msg_id, '+FLAGS', '\\Deleted')
-
-        # Permanently remove deleted emails
         mail.expunge()
-
-        print(f"🗑️ Deleted email ID: {msg_id}")
-
+        mail.logout()
+        print(f"🗑️ Deleted email ID: {msg_id.decode()}")
     except Exception as e:
         print("Error deleting mail:", e)
 
 
 def extract_otp(body):
-    """Extracts any OTP number that has minimum 3 digits (3 or more)."""
+    """Extract OTP with at least 3 digits."""
     match = re.search(r'\b(\d{3,})\b', body)
     return match.group(1) if match else None
 
-def get_latest_mail_from():
+
+def get_latest_mail_from(sender_email):
     try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-        mail.login(EMAIL, PASSWORD)
-        mail.select("inbox")
+        mail = connect_mail()
 
-        status, messages = mail.search(None, f'(FROM "{EMAIL}")')
-
+        status, messages = mail.search(None, f'(FROM "{sender_email}")')
         if status != "OK":
             return None
 
@@ -53,45 +55,41 @@ def get_latest_mail_from():
         msg = email.message_from_bytes(msg_data[0][1])
 
         # Decode subject
-        subject, encoding = decode_header(msg["Subject"])[0]
-        if isinstance(subject, bytes):
-            subject = subject.decode(encoding or "utf-8")
+        subject_raw = decode_header(msg["Subject"])[0]
+        subject = subject_raw[0].decode(subject_raw[1] or "utf-8") if isinstance(subject_raw[0], bytes) else subject_raw[0]
 
         sender = msg.get("From")
 
-        # Extract body (supports both text/plain & text/html)
+        # Extract body
         body = ""
         if msg.is_multipart():
             for part in msg.walk():
-                ctype = part.get_content_type()
-                if ctype == "text/plain":
+                ct = part.get_content_type()
+                if ct == "text/plain":
                     body = part.get_payload(decode=True).decode(errors="ignore")
                     break
-                if ctype == "text/html":
+                if ct == "text/html":
                     html = part.get_payload(decode=True).decode(errors="ignore")
                     soup = BeautifulSoup(html, "html.parser")
-                    body = soup.get_text(separator="\n").strip()
+                    body = soup.get_text("\n").strip()
         else:
-            ctype = msg.get_content_type()
-            if ctype == "text/plain":
+            ct = msg.get_content_type()
+            if ct == "text/plain":
                 body = msg.get_payload(decode=True).decode(errors="ignore")
-            elif ctype == "text/html":
+            elif ct == "text/html":
                 html = msg.get_payload(decode=True).decode(errors="ignore")
                 soup = BeautifulSoup(html, "html.parser")
-                body = soup.get_text(separator="\n").strip()
+                body = soup.get_text("\n").strip()
+
+        mail.logout()
 
         return {
             "subject": subject,
             "from": sender,
             "body": body.strip(),
-            "latest_id":latest_id
+            "latest_id": latest_id
         }
 
     except Exception as e:
         print("Error:", e)
         return None
-
-
-# msg = get_latest_mail_from("LG_GRADE_A_SALES@lge.com")
-# print(msg["body"])
-# print(extract_otp(msg["body"]))
