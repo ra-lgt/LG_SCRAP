@@ -198,8 +198,9 @@ def run_scraper(url, count, min_amount, max_amount, percentage):
 
 if __name__ == "__main__":
     url=input("Enter URL: ")
-    max_amount=int(input("Enter max amount: "))
     min_amount=int(input("Enter min amount: "))
+    max_amount=int(input("Enter max amount: "))
+    tab_count=int(input("Enter tab count: "))
     percentage=[int(x) for x in input("Enter percentage: ").split(",")]
 
-    run_scraper(url, count=4, min_amount=min_amount, max_amount=max_amount, percentage=percentage)
+    run_scraper(url, count=tab_count, min_amount=min_amount, max_amount=max_amount, percentage=percentage)
