@@ -4,7 +4,6 @@ from email.header import decode_header
 from bs4 import BeautifulSoup
 import re
 
-
 IMAP_SERVER = "imap.gmail.com"
 EMAIL = "asm.electronics.pune@gmail.com"
 PASSWORD = "uxfhzpavjlmmchov"  # Gmail App Password
@@ -17,27 +16,24 @@ def connect_mail():
     return mail
 
 
-def delete_mail_by_id(msg_id):
-    """
-    Deletes email safely.
-    """
+def delete_mail_by_id(mail, msg_id):
+    """Delete email safely using same IMAP connection."""
     try:
-        mail = connect_mail()
-        mail.store(msg_id, '+FLAGS', '\\Deleted')
+        mail.store(msg_id, "+FLAGS", "\\Deleted")
         mail.expunge()
-        mail.logout()
         print(f"🗑️ Deleted email ID: {msg_id.decode()}")
     except Exception as e:
-        print("Error deleting mail:", e)
+        print("❌ Error deleting mail:", e)
 
 
 def extract_otp(body):
     """Extract OTP with at least 3 digits."""
-    match = re.search(r'\b(\d{3,})\b', body)
+    match = re.search(r"\b(\d{3,})\b", body)
     return match.group(1) if match else None
 
 
 def get_latest_mail_from(sender_email):
+    """Return latest email only if the subject contains 'OTP Validation'."""
     try:
         mail = connect_mail()
 
@@ -51,16 +47,26 @@ def get_latest_mail_from(sender_email):
 
         latest_id = email_ids[-1]
 
+        # Fetch mail data
         status, msg_data = mail.fetch(latest_id, "(RFC822)")
         msg = email.message_from_bytes(msg_data[0][1])
 
         # Decode subject
         subject_raw = decode_header(msg["Subject"])[0]
-        subject = subject_raw[0].decode(subject_raw[1] or "utf-8") if isinstance(subject_raw[0], bytes) else subject_raw[0]
+        subject = (
+            subject_raw[0].decode(subject_raw[1] or "utf-8")
+            if isinstance(subject_raw[0], bytes)
+            else subject_raw[0]
+        )
+
+        # ⭐ FILTER: Subject must contain "OTP Validation"
+        if "otp validation" not in subject.lower():
+            mail.logout()
+            return None
 
         sender = msg.get("From")
 
-        # Extract body
+        # Extract body (HTML or plain text)
         body = ""
         if msg.is_multipart():
             for part in msg.walk():
@@ -81,15 +87,14 @@ def get_latest_mail_from(sender_email):
                 soup = BeautifulSoup(html, "html.parser")
                 body = soup.get_text("\n").strip()
 
-        mail.logout()
-
         return {
             "subject": subject,
             "from": sender,
             "body": body.strip(),
-            "latest_id": latest_id
+            "latest_id": latest_id,
+            "mail": mail,  # KEEP MAIL OPEN → allow deletion
         }
 
     except Exception as e:
-        print("Error:", e)
+        print("❌ Error:", e)
         return None

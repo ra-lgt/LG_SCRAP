@@ -13,8 +13,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from mail import get_latest_mail_from, extract_otp, delete_mail_by_id
 
 
-# 🔐 Only ONE thread should handle OTP popup
 OTP_LOCK = threading.Lock()
+
+URL_REFRESH_EVENT = threading.Event()
 
 
 class LG_SCRAP:
@@ -29,123 +30,155 @@ class LG_SCRAP:
             options=self.options
         )
 
-        self.wait = WebDriverWait(self.driver, 15)
+        self.wait = WebDriverWait(self.driver, 10)
         self.max_amount = max_amount
         self.min_amount = min_amount
         self.percentage = percentage
 
-    # Run after OTP success
     def close_all_popup(self):
         try:
-            for _ in range(30):  # try 30 times to close confirm dialogs
+            for _ in range(25):
                 self.driver.execute_script("window.confirm = () => true;")
-                time.sleep(0.2)
+                time.sleep(0.1)
         except:
             pass
+
+    def navigate_new_tab(self):
+        # Open new tab
+        self.driver.execute_script(f"window.open('{self.url}', '_blank');")
+        
+        # Switch to newest tab
+        new_tab = self.driver.window_handles[-1]
+        self.driver.switch_to.window(new_tab)
+
+        print(f"[THREAD {threading.get_ident()}] 🔄 Switched to NEW TAB")
+
+
+
+    def detect_no_data_popup(self):
+        try:
+            msg = self.driver.execute_script(
+                "return window.lastAlertMessage || ''"
+            )
+            if "No data found" in msg:
+                print(f"[THREAD {threading.get_ident()}] ❗ END OF PAGINATION DETECTED")
+                return True
+        except:
+            pass
+        return False
 
     def start_scrap(self):
         thread_id = threading.get_ident()
         print(f"[THREAD {thread_id}] 🚗 Browser Started")
 
         self.driver.get(self.url)
-        print(f"[THREAD {thread_id}] 🌍 Page Loaded")
 
         while True:
+
+            # If ANY thread ordered refresh
+            if URL_REFRESH_EVENT.is_set():
+                print(f"[THREAD {thread_id}] 👀 Received refresh signal → switching tab")
+                self.navigate_new_tab()
+                URL_REFRESH_EVENT.clear()
+
             try:
-                # Auto confirm popups
                 self.driver.execute_script("window.confirm = () => true;")
             except:
                 pass
 
+            # Detect “No data found”
+            if self.detect_no_data_popup():
+                URL_REFRESH_EVENT.set()
+                continue
+
             try:
-                # Check if table exists
-                table_exists = self.driver.execute_script(
-                    "return document.getElementsByTagName('table').length > 0;"
-                )
+                js_array = ",".join(map(str, self.percentage))
 
-                if table_exists:
-                    print(f"[THREAD {thread_id}] 📊 Table Found")
+                script = f"""
+                    const table = document.getElementsByTagName('table')[0];
+                    if (!table) return -1;
 
-                    js_array = ",".join(map(str, self.percentage))
+                    var rows = Array.from(table.getElementsByTagName('tr'));
+                    var clickList = [];
 
-                    # JS to select checkboxes
-                    script = f"""
-                        const table = document.getElementsByTagName('table')[0];
-                        var rows = Array.from(table.getElementsByTagName('tr'));
-                        var clickList = [];
+                    rows.forEach((row, idx) => {{
+                        if (idx === 0) return;
 
-                        rows.forEach((row, idx) => {{
-                            if (idx === 0) return;
+                        let price = row.querySelectorAll('td')[11];
+                        let percent = row.querySelectorAll('td')[12];
 
-                            let price = row.querySelectorAll('td')[11];
-                            let percent = row.querySelectorAll('td')[12];
+                        if (price) {{
+                            let priceVal = parseFloat(price.querySelector('span').innerHTML.replace(',', ''));
+                            let percVal = parseFloat(percent.querySelector('span').innerHTML);
 
-                            if (price) {{
-                                let priceVal = parseFloat(price.querySelector('span').innerHTML.replace(',', ''));
-                                let percVal = parseFloat(percent.querySelector('span').innerHTML);
-
-                                if ([{js_array}].includes(percVal)) {{
-                                    if (priceVal >= {self.min_amount} && priceVal <= {self.max_amount}) {{
-                                        let cb = row.querySelector("input[type='checkbox']");
-                                        if (cb) clickList.push(cb);
-                                    }}
+                            if ([{js_array}].includes(percVal)) {{
+                                if (priceVal >= {self.min_amount} && priceVal <= {self.max_amount}) {{
+                                    let cb = row.querySelector("input[type='checkbox']");
+                                    if (cb) clickList.push(cb);
                                 }}
                             }}
-                        }});
+                        }}
+                    }});
 
-                        clickList.forEach(cb => cb.click());
-                        return clickList.length;
-                    """
+                    clickList.forEach(cb => cb.click());
+                    return clickList.length;
+                """
 
-                    clicked = self.driver.execute_script(script)
-                    print(f"[THREAD {thread_id}] ☑️ Selected {clicked} rows")
+                clicked = self.driver.execute_script(script)
 
-                    if clicked > 0:
-                        print(f"[THREAD {thread_id}] 💾 Clicking SAVE")
+                if clicked == 0:
+                    print(f"[THREAD {thread_id}] ⏭ No rows matched → refreshing...")
+                    self.driver.refresh()
+                    continue
+
+                if clicked == -1:
+                    continue
+
+                print(f"[THREAD {thread_id}] ☑️ Selected {clicked} rows")
+
+                if clicked > 0:
+                    print(f"[THREAD {thread_id}] 💾 Saving")
+                    if OTP_LOCK.acquire(blocking=False):
+
+                        print(f"[THREAD {thread_id}] 🔐 OTP_LOCK acquired")
+
                         self.driver.execute_script("document.getElementById('btnSave').click()")
 
-                        # Acquire OTP LOCK
-                        if OTP_LOCK.acquire(blocking=False):
-                            print(f"[THREAD {thread_id}] 🔐 OTP_LOCK acquired")
+                        try:
+                            input_field = self.wait.until(
+                                EC.presence_of_element_located((By.ID, "otpInput"))
+                            )
 
-                            try:
-                                input_field = self.wait.until(
-                                    EC.presence_of_element_located((By.ID, "otpInput"))
+                            print(f"[THREAD {thread_id}] 📩 Waiting for OTP")
+                            otp = None
+
+                            for _ in range(5):
+                                msg = get_latest_mail_from("LG_GRADE_A_SALES@lge.com")
+                                if msg:
+                                    otp = extract_otp(msg["body"])
+                                    if otp:
+                                        break
+                                time.sleep(2)
+
+                            if otp:
+                                print(f"[THREAD {thread_id}] 🔢 OTP → {otp}")
+                                input_field.send_keys(otp)
+
+                                self.driver.execute_script(
+                                    "document.querySelector(\"input[title='Place Order']\").click();"
                                 )
-                                print(f"[THREAD {thread_id}] ⏳ Waiting for OTP Mail")
 
-                                otp = None
-                                for _ in range(8):
-                                    msg = get_latest_mail_from("LG_GRADE_A_SALES@lge.com")
-                                    if msg:
-                                        otp = extract_otp(msg["body"])
-                                        if otp:
-                                            print(f"[THREAD {thread_id}] 🔢 OTP: {otp}")
-                                            break
-                                    time.sleep(2)
-                                import pdb;pdb.set_trace()
+                                delete_mail_by_id(msg['mail'],msg["latest_id"])
 
-                                if otp:
-                                    input_field.send_keys(otp)
+                                print(f"[THREAD {thread_id}] ✔ OTP SUCCESS → Restarting tab")
+                                self.close_all_popup()
 
-                                    print(f"[THREAD {thread_id}] 📤 Submitting OTP")
-                                    self.driver.execute_script(
-                                        "document.querySelector(\"input[title='Place Order']\").click();"
-                                    )
+                                URL_REFRESH_EVENT.set()
 
-                                    delete_mail_by_id(msg["latest_id"])
+                        finally:
+                            OTP_LOCK.release()
+                            print(f"[THREAD {thread_id}] 🔓 OTP_LOCK released")
 
-                                    print(f"[THREAD {thread_id}] 🧹 Closing popups…")
-                                    self.close_all_popup()
-
-                                else:
-                                    print(f"[THREAD {thread_id}] ❌ OTP not found")
-
-                            finally:
-                                OTP_LOCK.release()
-                                print(f"[THREAD {thread_id}] 🔓 OTP_LOCK released")
-
-                # Continue pagination and loop
                 self.driver.refresh()
 
             except Exception as e:
@@ -154,7 +187,7 @@ class LG_SCRAP:
 
 
 def run_scraper(url, count, min_amount, max_amount, percentage):
-    print(f"\n🚀 Starting {count} thread(s) scraper\n")
+    print(f"\n🚀 Starting {count} threads\n")
 
     with ThreadPoolExecutor(max_workers=count) as executor:
         for _ in range(count):
@@ -165,8 +198,8 @@ def run_scraper(url, count, min_amount, max_amount, percentage):
 
 if __name__ == "__main__":
     url = "https://www.lg4all.com/POD/NGSI_CustomerBiddingInput.aspx?ReturnUrl=%2fpod%2f%3fCode%3dIN055255001H&Code=IN055255001H"
-    min_amount =45999 
-    max_amount =46000 
+    min_amount = 132999      
+    max_amount = 133000     
     percentage = [50, 70]
 
-    run_scraper(url, count=1, min_amount=min_amount, max_amount=max_amount, percentage=percentage)
+    run_scraper(url, count=4, min_amount=min_amount, max_amount=max_amount, percentage=percentage)
