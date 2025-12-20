@@ -201,16 +201,9 @@ def run_scraper(url, count, min_amount, max_amount, percentage):
 
 
 if __name__ == "__main__":
-    # url=input("Enter URL: ")
-    # min_amount=int(input("Enter min amount: "))
-    # max_amount=int(input("Enter max amount: "))
-    # tab_count=int(input("Enter tab count: "))
-    # percentage=[int(x) for x in input("Enter percentage: ").split(",")]
-
-    url="https://www.lg4all.com/POD/NGSI_CustomerBiddingInput.aspx?ReturnUrl=%2fpod%2f%3fCode%3dIN053139001H&Code=IN053139001H"
-    min_amount=36990 
-    max_amount=36991 
-    tab_count=2
-    percentage=[50]
-
+    url=input("Enter URL: ")
+    min_amount=int(input("Enter min amount: "))
+    max_amount=int(input("Enter max amount: "))
+    tab_count=int(input("Enter tab count: "))
+    percentage=[int(x) for x in input("Enter percentage: ").split(",")]
     run_scraper(url, count=tab_count, min_amount=min_amount, max_amount=max_amount, percentage=percentage)
