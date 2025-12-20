@@ -74,116 +74,120 @@ class LG_SCRAP:
         self.driver.get(self.url)
 
         while True:
-
-            # If ANY thread ordered refresh
-            if URL_REFRESH_EVENT.is_set():
-                print(f"[THREAD {thread_id}] 👀 Received refresh signal → switching tab")
-                self.navigate_new_tab()
-                URL_REFRESH_EVENT.clear()
-
             try:
-                self.driver.execute_script("window.confirm = () => true;")
-            except:
-                pass
 
-            # Detect “No data found”
-            if self.detect_no_data_popup():
-                URL_REFRESH_EVENT.set()
-                continue
+                # If ANY thread ordered refresh
+                if URL_REFRESH_EVENT.is_set():
+                    print(f"[THREAD {thread_id}] 👀 Received refresh signal → switching tab")
+                    self.navigate_new_tab()
+                    URL_REFRESH_EVENT.clear()
 
-            try:
-                js_array = ",".join(map(str, self.percentage))
+                try:
+                    self.driver.execute_script("window.confirm = () => true;")
+                except:
+                    pass
 
-                script = f"""
-                    const table = document.getElementsByTagName('table')[0];
-                    if (!table) return -1;
+                # Detect “No data found”
+                if self.detect_no_data_popup():
+                    URL_REFRESH_EVENT.set()
+                    continue
 
-                    var rows = Array.from(table.getElementsByTagName('tr'));
-                    var clickList = [];
+                try:
+                    js_array = ",".join(map(str, self.percentage))
 
-                    rows.forEach((row, idx) => {{
-                        if (idx === 0) return;
+                    script = f"""
+                        const table = document.getElementsByTagName('table')[0];
+                        if (!table) return -1;
 
-                        let price = row.querySelectorAll('td')[11];
-                        let percent = row.querySelectorAll('td')[12];
+                        var rows = Array.from(table.getElementsByTagName('tr'));
+                        var clickList = [];
 
-                        if (price) {{
-                            let priceVal = parseFloat(price.querySelector('span').innerHTML.replace(',', ''));
-                            let percVal = parseFloat(percent.querySelector('span').innerHTML);
+                        rows.forEach((row, idx) => {{
+                            if (idx === 0) return;
 
-                            if ([{js_array}].includes(percVal)) {{
-                                if (priceVal >= {self.min_amount} && priceVal <= {self.max_amount}) {{
-                                    let cb = row.querySelector("input[type='checkbox']");
-                                    if (cb) clickList.push(cb);
+                            let price = row.querySelectorAll('td')[11];
+                            let percent = row.querySelectorAll('td')[12];
+
+                            if (price) {{
+                                let priceVal = parseFloat(price.querySelector('span').innerHTML.replace(',', ''));
+                                let percVal = parseFloat(percent.querySelector('span').innerHTML);
+
+                                if ([{js_array}].includes(percVal)) {{
+                                    if (priceVal >= {self.min_amount} && priceVal <= {self.max_amount}) {{
+                                        let cb = row.querySelector("input[type='checkbox']");
+                                        if (cb) clickList.push(cb);
+                                    }}
                                 }}
                             }}
-                        }}
-                    }});
+                        }});
 
-                    clickList.forEach(cb => cb.click());
-                    return clickList.length;
-                """
+                        clickList.forEach(cb => cb.click());
+                        return clickList.length;
+                    """
 
-                clicked = self.driver.execute_script(script)
+                    clicked = self.driver.execute_script(script)
 
-                if clicked == 0:
-                    print(f"[THREAD {thread_id}] ⏭ No rows matched → refreshing...")
-                    self.driver.refresh()
-                    continue
+                    if clicked == 0:
+                        print(f"[THREAD {thread_id}] ⏭ No rows matched → refreshing...")
+                        self.driver.refresh()
+                        continue
 
-                if clicked == -1:
-                    continue
+                    if clicked == -1:
+                        continue
 
-                print(f"[THREAD {thread_id}] ☑️ Selected {clicked} rows")
+                    print(f"[THREAD {thread_id}] ☑️ Selected {clicked} rows")
 
-                if clicked > 0:
-                    print(f"[THREAD {thread_id}] 💾 Saving")
-                    if OTP_LOCK.acquire(blocking=False):
+                    if clicked > 0:
+                        print(f"[THREAD {thread_id}] 💾 Saving")
+                        if OTP_LOCK.acquire(blocking=False):
 
-                        print(f"[THREAD {thread_id}] 🔐 OTP_LOCK acquired")
+                            print(f"[THREAD {thread_id}] 🔐 OTP_LOCK acquired")
+                            URL_REFRESH_EVENT.set()
 
-                        self.driver.execute_script("document.getElementById('btnSave').click()")
+                            self.driver.execute_script("document.getElementById('btnSave').click()")
 
-                        try:
-                            input_field = self.wait.until(
-                                EC.presence_of_element_located((By.ID, "otpInput"))
-                            )
-
-                            print(f"[THREAD {thread_id}] 📩 Waiting for OTP")
-                            otp = None
-
-                            for _ in range(5):
-                                msg = get_latest_mail_from("LG_GRADE_A_SALES@lge.com")
-                                if msg:
-                                    otp = extract_otp(msg["body"])
-                                    if otp:
-                                        break
-                                time.sleep(2)
-
-                            if otp:
-                                print(f"[THREAD {thread_id}] 🔢 OTP → {otp}")
-                                input_field.send_keys(otp)
-
-                                self.driver.execute_script(
-                                    "document.querySelector(\"input[title='Place Order']\").click();"
+                            try:
+                                input_field = self.wait.until(
+                                    EC.presence_of_element_located((By.ID, "otpInput"))
                                 )
 
-                                delete_mail_by_id(msg['mail'],msg["latest_id"])
+                                print(f"[THREAD {thread_id}] 📩 Waiting for OTP")
+                                otp = None
 
-                                print(f"[THREAD {thread_id}] ✔ OTP SUCCESS → Restarting tab")
-                                self.close_all_popup()
+                                for _ in range(5):
+                                    msg = get_latest_mail_from("LG_GRADE_A_SALES@lge.com")
+                                    if msg:
+                                        otp = extract_otp(msg["body"])
+                                        if otp:
+                                            break
+                                    time.sleep(2)
 
-                                URL_REFRESH_EVENT.set()
+                                if otp:
+                                    print(f"[THREAD {thread_id}] 🔢 OTP → {otp}")
+                                    input_field.send_keys(otp)
 
-                        finally:
-                            OTP_LOCK.release()
-                            print(f"[THREAD {thread_id}] 🔓 OTP_LOCK released")
+                                    self.driver.execute_script(
+                                        "document.querySelector(\"input[title='Place Order']\").click();"
+                                    )
 
-                self.driver.refresh()
+                                    delete_mail_by_id(msg['mail'],msg["latest_id"])
 
+                                    print(f"[THREAD {thread_id}] ✔ OTP SUCCESS → Restarting tab")
+                                    self.close_all_popup()
+
+                                    URL_REFRESH_EVENT.set()
+
+                            finally:
+                                OTP_LOCK.release()
+                                print(f"[THREAD {thread_id}] 🔓 OTP_LOCK released")
+
+                    self.driver.refresh()
+
+                except Exception as e:
+                    print(f"[THREAD {thread_id}] ❌ Error: {e}")
+                    self.driver.refresh()
             except Exception as e:
-                print(f"[THREAD {thread_id}] ❌ Error: {e}")
-                self.driver.refresh()
+                print(f"[THREAD {thread_id}] ❌ Critical Error: {e}")
 
 
 def run_scraper(url, count, min_amount, max_amount, percentage):
@@ -197,10 +201,16 @@ def run_scraper(url, count, min_amount, max_amount, percentage):
 
 
 if __name__ == "__main__":
-    url=input("Enter URL: ")
-    min_amount=int(input("Enter min amount: "))
-    max_amount=int(input("Enter max amount: "))
-    tab_count=int(input("Enter tab count: "))
-    percentage=[int(x) for x in input("Enter percentage: ").split(",")]
+    # url=input("Enter URL: ")
+    # min_amount=int(input("Enter min amount: "))
+    # max_amount=int(input("Enter max amount: "))
+    # tab_count=int(input("Enter tab count: "))
+    # percentage=[int(x) for x in input("Enter percentage: ").split(",")]
+
+    url="https://www.lg4all.com/POD/NGSI_CustomerBiddingInput.aspx?ReturnUrl=%2fpod%2f%3fCode%3dIN053139001H&Code=IN053139001H"
+    min_amount=36990 
+    max_amount=36991 
+    tab_count=2
+    percentage=[50]
 
     run_scraper(url, count=tab_count, min_amount=min_amount, max_amount=max_amount, percentage=percentage)
