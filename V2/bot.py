@@ -3,12 +3,17 @@
 
 import json
 import os
+import re
 import sys
 import time
-from urllib.parse import urlparse
+import uuid
 
 import httpx
 from lxml import html
+
+
+OTP_TIMEOUT = float(os.environ.get("OTP_TIMEOUT_S", "90"))
+OTP_POLL_INTERVAL = float(os.environ.get("OTP_POLL_INTERVAL_S", "2"))
 
 
 def _log(level: str, message: str) -> None:
@@ -65,6 +70,7 @@ class LGBot:
         self.bids_placed = 0
         self.detected_count = 0
         self.failed_count = 0
+        self.otp_received = 0
 
         self.min_price: float | None = None
         self.max_price: float | None = None
@@ -109,6 +115,7 @@ class LGBot:
                     "detected": self.detected_count,
                     "booked": self.bids_placed,
                     "failed": self.failed_count,
+                    "otp_received": self.otp_received,
                     "response_time_ms": response_time_ms,
                     "iteration": self.iter,
                     "filter_id": self.filter_id or "",
@@ -161,10 +168,13 @@ class LGBot:
             p = price(r["dealer_price"])
             d = dp(r["dp"])
             if self.min_price is not None and p < self.min_price:
+                _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{r['dealer_price']} < min ₹{self.min_price}")
                 continue
             if self.max_price is not None and p > self.max_price:
+                _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{r['dealer_price']} > max ₹{self.max_price}")
                 continue
             if self.dp_percent is not None and d < self.dp_percent:
+                _log("scan", f"Reject {r['serial_no'][:15]}: DP {d}% < {self.dp_percent}%")
                 continue
             filtered.append(r)
         return filtered
@@ -188,13 +198,15 @@ class LGBot:
             select = tree.xpath(f'//select[@id="{name}"]')
             if not select:
                 continue
-            options = select[0].xpath('.//option/@value')
-            chosen = "--Select--"
+            options = select[0].xpath('./option')
+            chosen = None
             for opt in options:
-                if opt != "--Select--":
-                    chosen = opt
+                if opt.get("selected") is not None:
+                    chosen = opt.get("value")
                     break
-            self.dropdowns[ctl_name] = chosen
+            if chosen is None and options:
+                chosen = options[0].get("value")
+            self.dropdowns[ctl_name] = chosen or "--Select--"
         labels = {k.split("$")[-1]: v for k, v in self.dropdowns.items()}
         _log("info", f"Dropdowns: {labels}")
 
@@ -320,93 +332,91 @@ class LGBot:
             pass
         return resp
 
-    @property
-    def _pm_base(self) -> str:
-        p = urlparse(self.url)
-        path = p.path.rstrip("/")
-        if path.endswith(".aspx"):
-            base = path
-        else:
-            base = path + "/NGSI_CustomerBiddingInput.aspx"
-        return f"{p.scheme}://{p.netloc}{base}"
-
-    def _build_row_data(self, inventory: list[dict]) -> list[dict]:
-        def num(s: str) -> float:
-            s = s.replace(",", "").strip()
-            return float(s) if s else 0.0
-        rows = []
-        for r in inventory:
-            rows.append({
-                "Branch": r["branch"],
-                "Serial_No": r["serial_no"],
-                "Image_Name": r["image_name"],
-                "DmgImage_Name": r["dmg_image"],
-                "ModelCode": r["model_code"],
-                "Product": r["product"],
-                "Disc_Category": r["category"],
-                "Bidding_StartDate": r["from_date"],
-                "Bidding_EndDate": r["to_date"],
-                "Base_Price": num(r["base_price"]),
-                "batchno": r["batchno"],
-                "dp": num(r["dp"]),
-                "Created_By": self.ship_to,
-                "Ship_To_Code": self.ship_to,
-            })
-        return rows
-
-    def _call_pm(self, method: str, body: dict) -> dict | None:
-        url = f"{self._pm_base}/{method}"
-        t0 = time.perf_counter()
-        try:
-            resp = self.sess.post(url, json=body, headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "X-Requested-With": "XMLHttpRequest",
-            })
-        except Exception as e:
-            _log("warn", f"{method} failed: {e}")
+    def _otp_api(self, method: str, payload: dict) -> dict | None:
+        if not self.api_url:
+            _log("error", "No API URL — cannot run OTP flow")
             return None
-        wall = (time.perf_counter() - t0) * 1000
         try:
-            data = resp.json()
-            result = str(data.get("d", "N/A"))[:120]
-            _log("action", f"{method} HTTP {resp.status_code} | {wall:.0f}ms | {result}")
-            return data
+            resp = httpx.post(
+                f"{self.api_url}/api/bot/otp/{method}",
+                json=payload,
+                headers={"X-SERVICE-KEY": self.service_key},
+                timeout=30,
+            )
+        except Exception as e:
+            _log("warn", f"otp/{method} failed: {e}")
+            return None
+        try:
+            return resp.json()
         except Exception:
-            _log("warn", f"{method} HTTP {resp.status_code} | {wall:.0f}ms | non-json response")
-            return {"d": None}
+            _log("warn", f"otp/{method} HTTP {resp.status_code} | non-json response")
+            return None
 
-    def _try_all(self, inventory: list[dict]) -> bool:
-        rows = self._build_row_data(inventory)
-        _log("action", f"Booking {len(rows)} item(s) — trying S1→S2→S3")
+    def fetch_otp(self, inventory: list[dict]) -> bool:
+        if not self.ship_to:
+            _log("warn", "No ship-to code; skipping OTP flow")
+            return False
+        _log("action", f"OTP flow for {len(inventory)} item(s) — begin")
 
-        _log("action", "Strategy S1: SaveBiddingData direct")
-        r1 = self._call_pm("SaveBiddingData", {"selectedRows": rows})
-        if r1 and r1.get("d") and "SUCCESS" in str(r1.get("d")).upper():
-            d = str(r1["d"])[:120]
-            _log("success", f"S1 success: {d}")
-            self.bids_placed += 1
-            return True
-        _log("info", "S1 skipped, trying S2")
+        begin = self._otp_api("begin", {
+            "worker_id": self.worker_id,
+            "ship_to": self.ship_to,
+            "email": self.email,
+            "app_password": self.app_password,
+            "item_count": len(inventory),
+        })
+        if not begin:
+            return False
+        if begin.get("status") == "busy":
+            _log("warn", "OTP lock held by another worker — retrying next iteration")
+            return False
+        req_id = begin.get("otp_request_id")
+        if not req_id:
+            _log("error", f"OTP begin failed: {begin}")
+            return False
 
-        _log("action", "Strategy S2: btnSave → SaveBiddingData")
-        self.save(inventory)
-        r2 = self._call_pm("SaveBiddingData", {"selectedRows": rows})
-        if r2 and r2.get("d") and "SUCCESS" in str(r2.get("d")).upper():
-            d = str(r2["d"])[:120]
-            _log("success", f"S2 success: {d}")
-            self.bids_placed += 1
-            return True
-        _log("info", "S2 skipped, trying S3")
+        # Click Submit → portal emails the OTP (never submit the OTP itself)
+        resp = self.save(inventory)
+        if resp is None:
+            _log("error", "Submit failed; cancelling OTP request")
+            self._otp_api("cancel", {"otp_request_id": req_id})
+            return False
 
-        _log("action", "Strategy S3: btnSave → ValidateOtp → SaveBiddingData")
-        r3_v = self._call_pm("ValidateOtp", {"enteredOtp": "000000", "shipToCode": self.ship_to})
-        r3_s = self._call_pm("SaveBiddingData", {"selectedRows": rows})
-        if r3_s and r3_s.get("d") and "SUCCESS" in str(r3_s.get("d")).upper():
-            d = str(r3_s["d"])[:120]
-            _log("success", f"S3 success: {d}")
-            self.bids_placed += 1
-            return True
-        _log("error", "All strategies failed for this batch")
+        body_html = re.search(r"<body[^>]*>(.*?)</body>", self.last_html, re.S)
+        raw = body_html.group(1) if body_html else self.last_html
+        txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw))
+        real_otp_input = bool(re.search(r'id="[^"]*[Oo][Tt][Pp][^"]*"[^>]*type="text"|type="text"[^>]*id="[^"]*[Oo][Tt][Pp]', raw))
+        m = re.search(r"(?:Enter OTP|enter your otp|OTP has been sent|already|already selected|not selected|please select|invalid|expired|sent to your|submitted successfully|not allowed)", txt, re.I)
+        hint = m.group(0) if m else txt[-500:]
+        _log("info", f"Submit page: OTP-input={real_otp_input} | {hint}")
+        if real_otp_input:
+            mm = re.search(r".{0,200}Enter OTP.{0,400}", txt, re.I)
+            if mm:
+                _log("info", f"Submit page OTP dialog: {mm.group(0)}")
+
+        deadline = time.monotonic() + OTP_TIMEOUT
+        while time.monotonic() < deadline:
+            res = self._otp_api("fetch", {"otp_request_id": req_id})
+            if res:
+                status = res.get("status")
+                if status == "done":
+                    otp = res.get("otp")
+                    self.otp_received += 1
+                    _log("otp", f"OTP={otp} items={len(inventory)} worker={self.worker_id}")
+                    if res.get("raw_snippet"):
+                        _log("info", f"OTP email: {res['raw_snippet']}")
+                    for row in inventory:
+                        self._report_booking(row)
+                    _log("success", f"Reported {len(inventory)} booking(s) to API")
+                    self._otp_api("end", {"otp_request_id": req_id})
+                    return True
+                if status in ("timeout", "error", "cancelled"):
+                    _log("warn", f"OTP fetch ended: {status}")
+                    break
+            time.sleep(OTP_POLL_INTERVAL)
+
+        _log("warn", "OTP not received in time")
+        self._otp_api("cancel", {"otp_request_id": req_id})
         return False
 
     # ───────── forever loop ─────────
@@ -449,14 +459,12 @@ class LGBot:
                         self.detected_count += len(matched)
                         for i, r in enumerate(matched):
                             _log("detect", f"Match #{i+1}: {r['serial_no'][:15]} | {r['model_code']} | ₹{r['dealer_price']} | {r['dp']}%")
-                        ok = self._try_all(matched)
+                        ok = self.fetch_otp(matched)
                         if ok:
-                            _log("success", f"Booked {len(matched)} item(s)")
-                            for r in matched:
-                                self._report_booking(r)
+                            _log("success", f"OTP received for {len(matched)} item(s)")
                         else:
                             self.failed_count += 1
-                            _log("error", "Booking failed for all items in this iteration")
+                            _log("error", "OTP fetch failed or timed out for this batch")
                     else:
                         _log("scan", "No items match filter criteria")
                 else:
@@ -504,7 +512,6 @@ def main():
 
     if api_url and filter_id:
         if not worker_id:
-            import uuid
             worker_id = f"bot-{uuid.uuid4().hex[:8]}"
         bot = LGBot(
             api_url=api_url,
