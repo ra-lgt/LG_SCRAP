@@ -7,9 +7,16 @@ import re
 import sys
 import time
 import uuid
+from datetime import datetime
 
 import httpx
 from lxml import html
+
+try:
+    from websockets.sync.client import connect as ws_connect
+    HAS_WS = True
+except ImportError:
+    HAS_WS = False
 
 
 OTP_TIMEOUT = float(os.environ.get("OTP_TIMEOUT_S", "90"))
@@ -18,6 +25,43 @@ OTP_POLL_INTERVAL = float(os.environ.get("OTP_POLL_INTERVAL_S", "2"))
 
 def _log(level: str, message: str) -> None:
     print(json.dumps({"level": level, "message": message}))
+
+
+class _WSPusher:
+    """Lazy persistent WebSocket to the API for KPI pushes, with auto-reconnect.
+
+    Falls back to the caller when no connection can be established, so the bot
+    never blocks or dies on a dead socket.
+    """
+
+    def __init__(self, api_url: str, service_key: str):
+        self.api_url = api_url
+        self.service_key = service_key
+        self._ws = None
+
+    def _url(self) -> str:
+        base = self.api_url.replace("http://", "ws://").replace("https://", "wss://")
+        return f"{base}/ws/bot?service_key={self.service_key}"
+
+    def send(self, message: dict) -> bool:
+        if not HAS_WS:
+            return False
+        if self._ws is None:
+            try:
+                self._ws = ws_connect(self._url(), open_timeout=5, send_timeout=5)
+            except Exception:
+                self._ws = None
+                return False
+        try:
+            self._ws.send(json.dumps(message))
+            return True
+        except Exception:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            return False
 
 
 class LGBot:
@@ -71,6 +115,7 @@ class LGBot:
         self.detected_count = 0
         self.failed_count = 0
         self.otp_received = 0
+        self._detected_serials: set[str] = set()
 
         self.min_price: float | None = None
         self.max_price: float | None = None
@@ -78,6 +123,7 @@ class LGBot:
         self.scan_interval: float = 2.0
         self.email: str = ""
         self.app_password: str = ""
+        self._ws: _WSPusher | None = None
 
     def fetch_config(self) -> None:
         if not self.api_url or not self.filter_id:
@@ -104,33 +150,46 @@ class LGBot:
         _log("info", f"Scan: {self.scan_interval}s | Email: {self.email or 'none'}")
 
     def _send_kpi(self, response_time_ms: int) -> None:
+        payload = {
+            "worker_id": self.worker_id,
+            "status": "running",
+            "detected": self.detected_count,
+            "booked": self.bids_placed,
+            "failed": self.failed_count,
+            "otp_received": self.otp_received,
+            "response_time_ms": response_time_ms,
+            "iteration": self.iter,
+            "filter_id": self.filter_id or "",
+        }
         if not self.api_url:
+            return
+        if self._ws is None:
+            self._ws = _WSPusher(self.api_url, self.service_key)
+        if self._ws.send({"type": "kpi", "data": payload}):
             return
         try:
             httpx.post(
                 f"{self.api_url}/api/bot/report",
-                json={
-                    "worker_id": self.worker_id,
-                    "status": "running",
-                    "detected": self.detected_count,
-                    "booked": self.bids_placed,
-                    "failed": self.failed_count,
-                    "otp_received": self.otp_received,
-                    "response_time_ms": response_time_ms,
-                    "iteration": self.iter,
-                    "filter_id": self.filter_id or "",
-                },
+                json=payload,
                 headers={"X-SERVICE-KEY": self.service_key},
                 timeout=3,
             )
         except Exception:
             pass
 
+    @staticmethod
+    def _to_iso(date_str: str) -> str:
+        """Convert '22-Jan-2026' (portal format) to '2026-01-22' (ISO 8601)."""
+        try:
+            return datetime.strptime(date_str.strip(), "%d-%b-%Y").isoformat()
+        except (ValueError, TypeError):
+            return date_str.strip()
+
     def _report_booking(self, row: dict) -> None:
         if not self.api_url:
             return
         try:
-            httpx.post(
+            resp = httpx.post(
                 f"{self.api_url}/api/bot/bookings",
                 json={
                     "serialNo": row["serial_no"],
@@ -139,10 +198,10 @@ class LGBot:
                     "branch": row["branch"],
                     "billBranch": row["bill_branch"],
                     "category": row["category"],
-                    "biddingStart": row["from_date"],
-                    "biddingEnd": row["to_date"],
-                    "dealerPrice": float(row["dealer_price"].replace(",", "")),
-                    "discountPct": float(row["dp"]),
+                    "biddingStart": self._to_iso(row["from_date"]),
+                    "biddingEnd": self._to_iso(row["to_date"]),
+                    "dealerPrice": float(row["dealer_price"].replace(",", "").strip()),
+                    "discountPct": float((row["dp"] or "").replace("%", "").strip() or 0),
                     "status": "confirmed",
                     "workerId": self.worker_id,
                     "filterId": self.filter_id or "",
@@ -150,8 +209,10 @@ class LGBot:
                 headers={"X-SERVICE-KEY": self.service_key},
                 timeout=5,
             )
-        except Exception:
-            pass
+            if resp.status_code != 200:
+                _log("warn", f"Booking report HTTP {resp.status_code} | {resp.text[:200]}")
+        except Exception as e:
+            _log("warn", f"Booking report failed: {e}")
 
     def _filter_inventory(self, inventory: list[dict]) -> list[dict]:
         if self.min_price is None and self.max_price is None and self.dp_percent is None:
@@ -332,6 +393,101 @@ class LGBot:
             pass
         return resp
 
+    def _page_method_url(self, endpoint: str) -> str:
+        """Build the page-method URL exactly as the browser does.
+
+        ASP.NET page methods are POSTed to <page-dir>/<page-file>/<method> where
+        <page-file> comes from PageMethods.set_path(...) in the served HTML.
+        E.g. page https://host/pod/?Code=X with set_path("NGSI_CustomerBiddingInput.aspx")
+        -> https://host/pod/NGSI_CustomerBiddingInput.aspx/ValidateOtp.
+        """
+        base = self.url.split("?")[0].rstrip("/")
+        if base.lower().endswith(".aspx"):
+            directory = base.rsplit("/", 1)[0]
+        else:
+            directory = base
+        page = ""
+        if self.last_html:
+            m = re.search(r'PageMethods\.set_path\("([^"]+)"\)', self.last_html)
+            if m:
+                page = m.group(1).lstrip("/")
+        if not page:
+            page = "NGSI_CustomerBiddingInput.aspx"
+        return f"{directory}/{page}/{endpoint}"
+
+    def _page_method(self, endpoint: str, payload: dict) -> str | None:
+        """Call an ASP.NET AJAX page method ({page}/{method}).
+
+        Returns response.d (the .NET-serialized string), or None on transport /
+        HTTP error. Content-Type must be application/json and the session cookie
+        from self.sess is reused.
+        """
+        if not self.url:
+            return None
+        url = self._page_method_url(endpoint)
+        try:
+            resp = self.sess.post(
+                url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=30,
+            )
+        except Exception as e:
+            _log("warn", f"page method {endpoint} failed: {e}")
+            return None
+        _log("action", f"{endpoint} HTTP {resp.status_code} | {len(resp.content):,}B")
+        if resp.status_code != 200:
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            return None
+        return data.get("d")
+
+    def validate_otp(self, otp: str) -> str | None:
+        """POST ValidateOtp page method. Returns 'SUCCESS' (str) or error text."""
+        if not self.ship_to:
+            _log("warn", "No ship-to code; cannot validate OTP")
+            return None
+        return self._page_method("ValidateOtp", {
+            "enteredOtp": otp,
+            "shipToCode": self.ship_to,
+        })
+
+    def save_bidding_data(self, inventory: list[dict]) -> str | None:
+        """POST SaveBiddingData page method with the selected rows.
+
+        Mirrors the page's saveBiddingData() JS: only checked rows are sent, so
+        we pass every filtered row (the bot checks them all in save()).
+        """
+        selected = []
+        for r in inventory:
+            def num(s: str) -> float:
+                try:
+                    return float((s or "").replace(",", "").strip())
+                except ValueError:
+                    return 0.0
+            selected.append({
+                "Branch": r["branch"],
+                "Serial_No": r["serial_no"],
+                "Image_Name": r["image_name"],
+                "DmgImage_Name": r["dmg_image"],
+                "ModelCode": r["model_code"],
+                "Product": r["product"],
+                "Disc_Category": r["category"],
+                "Bidding_StartDate": r["from_date"],
+                "Bidding_EndDate": r["to_date"],
+                "Base_Price": num(r["base_price"]),
+                "batchno": r["batchno"],
+                "dp": num(r["dp"]),
+                "Created_By": self.ship_to,
+                "Ship_To_Code": self.ship_to,
+            })
+        return self._page_method("SaveBiddingData", {"selectedRows": selected})
+
     def _otp_api(self, method: str, payload: dict) -> dict | None:
         if not self.api_url:
             _log("error", "No API URL — cannot run OTP flow")
@@ -405,8 +561,25 @@ class LGBot:
                     _log("otp", f"OTP={otp} items={len(inventory)} worker={self.worker_id}")
                     if res.get("raw_snippet"):
                         _log("info", f"OTP email: {res['raw_snippet']}")
+
+                    validated = self.validate_otp(otp)
+                    if validated != "SUCCESS":
+                        _log("error", f"OTP validation failed: {validated or 'HTTP error'}")
+                        self._otp_api("cancel", {"otp_request_id": req_id})
+                        self.failed_count += 1
+                        return False
+
+                    _log("info", "OTP validated successfully")
+                    submit_msg = self.save_bidding_data(inventory)
+                    _log("info", f"SaveBiddingData: {submit_msg or 'no response'}")
+                    if submit_msg is None:
+                        self._otp_api("cancel", {"otp_request_id": req_id})
+                        self.failed_count += 1
+                        return False
+
                     for row in inventory:
                         self._report_booking(row)
+                    self.bids_placed += len(inventory)
                     _log("success", f"Reported {len(inventory)} booking(s) to API")
                     self._otp_api("end", {"otp_request_id": req_id})
                     return True
@@ -456,7 +629,9 @@ class LGBot:
                     _log("scan", f"{len(matched)} of {len(inventory)} item(s) match price/DP filter")
 
                     if matched:
-                        self.detected_count += len(matched)
+                        for r in matched:
+                            self._detected_serials.add(r["serial_no"])
+                        self.detected_count = len(self._detected_serials)
                         for i, r in enumerate(matched):
                             _log("detect", f"Match #{i+1}: {r['serial_no'][:15]} | {r['model_code']} | ₹{r['dealer_price']} | {r['dp']}%")
                         ok = self.fetch_otp(matched)
