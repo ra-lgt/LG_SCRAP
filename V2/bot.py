@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import signal
 import sys
 import time
 import uuid
@@ -335,9 +336,66 @@ class LGBot:
         self._extract_hidden(tree)
         return tree
 
+    GRID_ID = "gvNGSIDetails"
+    GRID_TARGET = "ctl00$ContentPlaceHolder1$gvNGSIDetails"
+
+    @staticmethod
+    def parse_pager(tree: html.HtmlElement) -> tuple[int, list[str], dict[int, str]]:
+        """Return (current_page, page_args, label_to_arg) from the grid's pager row.
+
+        ASP.NET GridView renders the pager as <a href="...__doPostBack(...Page$N...)">1</a>
+        for non-current pages and a <span>N</span> for the current page. We return the
+        raw `Page$N` arguments from the links (server-generated, so no guessing about
+        0- vs 1-based indexing), the current page number, and a mapping from visible
+        page label to its postback argument.
+        """
+        table = tree.xpath(f'//table[@id="{LGBot.GRID_ID}"]')
+        if not table:
+            return 1, [], {}
+        pager = table[0].xpath(
+            './/tr[contains(concat(" ", normalize-space(@class), " "), " paging ")]'
+        )
+        if not pager:
+            return 1, [], {}
+        current = 1
+        for s in pager[0].xpath('.//span'):
+            t = (s.text or "").strip()
+            if t.isdigit():
+                current = int(t)
+        args: list[str] = []
+        labels: dict[int, str] = {}
+        for a in pager[0].xpath('.//a[contains(@href, "Page$")]'):
+            m = re.search(r"Page\$(\d+)", a.get("href", ""))
+            label = (a.text or "").strip()
+            if m:
+                arg = f"Page${m.group(1)}"
+                args.append(arg)
+                if label.isdigit():
+                    labels[int(label)] = arg
+        return current, args, labels
+
+    @staticmethod
+    def _derive_page_arg(current: int, labels: dict[int, str]) -> str:
+        """Derive the postback arg for the *current* page from the observed links.
+
+        Link labels are the visible page numbers; their hrefs carry the raw `Page$N`
+        args. The constant offset (arg_number - label) reveals the grid's indexing
+        scheme, so we can rebuild the arg for the page we're standing on. Falls back
+        to `Page$<current>` when nothing can be derived.
+        """
+        offsets = []
+        for label, arg in labels.items():
+            m = re.search(r"Page\$(\d+)", arg)
+            if m:
+                offsets.append(int(m.group(1)) - label)
+        if offsets:
+            offset = offsets[0]
+            return f"Page${current + offset}"
+        return f"Page${current}"
+
     @staticmethod
     def parse_inventory(tree: html.HtmlElement) -> list[dict]:
-        table = tree.xpath('//table[@id="gvNGSIDetails"]')
+        table = tree.xpath(f'//table[@id="{LGBot.GRID_ID}"]')
         if not table:
             return []
         rows = table[0].xpath('.//tr[position()>1]')
@@ -370,6 +428,78 @@ class LGBot:
                 "defect":        g('.//*[contains(@id,"lbltypeofdefect_gv")]'),
             })
         return inventory
+
+    def _fetch_page(self, page_arg: str) -> html.HtmlElement | None:
+        """Fire the __doPostBack pager link for the given Page$N arg."""
+        data = {
+            "__VIEWSTATE": self.viewstate,
+            "__EVENTVALIDATION": self.eventvalidation,
+            "__VIEWSTATEGENERATOR": self.generator,
+            "__EVENTTARGET": self.GRID_TARGET,
+            "__EVENTARGUMENT": page_arg,
+            "__LASTFOCUS": "",
+            **self.dropdowns,
+        }
+        resp = self._post(data, f"PAGE {page_arg}")
+        if resp is None:
+            return None
+        try:
+            tree = html.fromstring(resp.content)
+        except Exception:
+            return None
+        self._extract_hidden(tree)
+        return tree
+
+    def collect_pages(self, tree: html.HtmlElement) -> list[tuple[str | None, list[dict]]]:
+        """Parse every grid page, returning (page_arg_or_None, rows) per page.
+
+        The first entry is the page the initial tree already shows; its page_arg
+        is derived from the observed pager links so callers can re-navigate to it.
+        The grid is left on the last page fetched — callers must re-navigate before
+        submitting (each page's checkboxes only exist in that page's viewstate).
+        """
+        current, page_args, labels = self.parse_pager(tree)
+        _log("scan", f"Grid page {current} | {len(self.parse_inventory(tree))} item(s) on current page")
+        initial_arg = None if not page_args else self._derive_page_arg(current, labels)
+        pages: list[tuple[str | None, list[dict]]] = [(initial_arg, self.parse_inventory(tree))]
+        seen: set[str] = {initial_arg}
+        pending = [a for a in page_args if a != initial_arg]
+        while pending:
+            arg = pending.pop(0)
+            if arg in seen:
+                continue
+            seen.add(arg)
+            tree2 = self._fetch_page(arg)
+            if tree2 is None:
+                _log("warn", f"Failed to load grid page {arg}")
+                continue
+            rows = self.parse_inventory(tree2)
+            _log("scan", f"Grid page {arg}: {len(rows)} item(s)")
+            pages.append((arg, rows))
+            _, more_args, more_labels = self.parse_pager(tree2)
+            for a in more_args:
+                if a not in seen and a not in pending:
+                    pending.append(a)
+        return pages
+
+    def collect_inventory(self, tree: html.HtmlElement) -> list[dict]:
+        """Flatten all grid pages into one de-duped inventory list."""
+        all_rows = []
+        for _, rows in self.collect_pages(tree):
+            all_rows.extend(rows)
+        return self._dedup_inventory(all_rows)
+
+    @staticmethod
+    def _dedup_inventory(rows: list[dict]) -> list[dict]:
+        seen: set[str] = set()
+        deduped = []
+        for r in rows:
+            key = r["serial_no"]
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+        return deduped
 
     def save(self, inventory: list[dict]) -> httpx.Response | None:
         data = {
@@ -531,7 +661,9 @@ class LGBot:
             _log("error", f"OTP begin failed: {begin}")
             return False
 
-        # Click Submit → portal emails the OTP (never submit the OTP itself)
+        # Click Submit → portal emails the OTP (never submit the OTP itself).
+        # `inventory` must only contain rows from the currently displayed grid
+        # page so the checkbox names are valid in the page's __VIEWSTATE.
         resp = self.save(inventory)
         if resp is None:
             _log("error", "Submit failed; cancelling OTP request")
@@ -599,7 +731,20 @@ class LGBot:
         if self.filter_id:
             _log("info", f"Filter: {self.filter_id}")
 
+        stopping = False
+
+        def _on_stop(signum, frame):
+            nonlocal stopping
+            stopping = True
+            _log("info", f"Received {signal.Signals(signum).name} — stopping | booked={self.bids_placed} detected={self.detected_count} failed={self.failed_count}")
+
+        signal.signal(signal.SIGTERM, _on_stop)
+        signal.signal(signal.SIGINT, _on_stop)
+
         while True:
+            if stopping:
+                _log("info", "Bot stopped gracefully")
+                break
             self.iter += 1
             t_start = time.perf_counter()
             _log("info", f"Iteration {self.iter} | booked={self.bids_placed} detected={self.detected_count} failed={self.failed_count}")
@@ -612,14 +757,17 @@ class LGBot:
                     continue
                 _log("info", f"Ship-to: {self.ship_to[:20]}")
 
-                inventory = self.parse_inventory(tree)
-                _log("scan", f"Found {len(inventory)} item(s) on page")
+                pages = self.collect_pages(tree)
+                inventory = [r for _, rows in pages for r in rows]
+                inventory = self._dedup_inventory(inventory)
+                _log("scan", f"Found {len(inventory)} item(s) across grid")
 
                 if not inventory:
                     _log("scan", "No items on page, sending search…")
                     tree2 = self.search()
                     if tree2 is not None:
-                        inventory = self.parse_inventory(tree2)
+                        pages = self.collect_pages(tree2)
+                        inventory = self._dedup_inventory([r for _, rows in pages for r in rows])
                         _log("scan", f"Found {len(inventory)} item(s) after search")
                     else:
                         _log("warn", "Search failed")
@@ -634,12 +782,29 @@ class LGBot:
                         self.detected_count = len(self._detected_serials)
                         for i, r in enumerate(matched):
                             _log("detect", f"Match #{i+1}: {r['serial_no'][:15]} | {r['model_code']} | ₹{r['dealer_price']} | {r['dp']}%")
-                        ok = self.fetch_otp(matched)
-                        if ok:
-                            _log("success", f"OTP received for {len(matched)} item(s)")
-                        else:
-                            self.failed_count += 1
-                            _log("error", "OTP fetch failed or timed out for this batch")
+
+                        # Submit per grid page: GridView only accepts checkboxes
+                        # from the currently displayed page in its viewstate.
+                        matched_serials = {r["serial_no"] for r in matched}
+                        any_ok = False
+                        for page_arg, rows in pages:
+                            page_matched = [r for r in rows if r["serial_no"] in matched_serials]
+                            if not page_matched:
+                                continue
+                            if page_arg is not None:
+                                tree_pg = self._fetch_page(page_arg)
+                                if tree_pg is None:
+                                    _log("warn", f"Failed to re-open grid page {page_arg} for submit")
+                                    continue
+                            ok = self.fetch_otp(page_matched)
+                            if ok:
+                                any_ok = True
+                                _log("success", f"OTP received for {len(page_matched)} item(s) on grid page {page_arg or 'current'}")
+                            else:
+                                self.failed_count += 1
+                                _log("error", f"OTP fetch failed or timed out for grid page {page_arg or 'current'}")
+                        if any_ok:
+                            _log("success", f"Placed bids across {sum(1 for _, r in pages if any(x['serial_no'] in matched_serials for x in r))} grid page(s)")
                     else:
                         _log("scan", "No items match filter criteria")
                 else:
