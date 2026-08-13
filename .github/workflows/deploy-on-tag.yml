@@ -1,0 +1,53 @@
+name: Deploy on Tag
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "dev-v*"
+
+env:
+  REGISTRY: ${{ secrets.REGISTRY_URL }}
+  REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+  REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+
+jobs:
+  build-and-deploy:
+    runs-on:
+      - self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract tag
+        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Determine environment
+        run: |
+          if [[ "${{ github.ref_name }}" == dev-v* ]]; then
+            echo "ENV=dev" >> $GITHUB_ENV
+          else
+            echo "ENV=prod" >> $GITHUB_ENV
+          fi
+
+      - name: Login to Docker Registry
+        run: |
+          echo "🔐 Logging into Docker registry: $REGISTRY"
+          echo "$REGISTRY_PASSWORD" | docker login \
+            -u "$REGISTRY_USERNAME" \
+            --password-stdin "$REGISTRY"
+          echo "✅ Docker login successful"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        run: |
+          echo "🐳 Building Docker image for tag: ${TAG}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -t $REGISTRY/srivishnutechlabs/lg-bot:${TAG} \
+            -t $REGISTRY/srivishnutechlabs/lg-bot:${ENV}-latest \
+            --push .
+          echo "✅ Image pushed: $REGISTRY/srivishnutechlabs/lg-bot:${TAG}"
