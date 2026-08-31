@@ -130,6 +130,9 @@ class LGBot:
         self.min_price: float | None = None
         self.max_price: float | None = None
         self.dp_percent: float | None = None
+        self.filter_by_price: bool = True
+        self.filter_by_dp: bool = True
+        self.serial_numbers: set[str] = set()
         self.scan_interval: float = 2.0
         self.email: str = ""
         self.app_password: str = ""
@@ -162,11 +165,16 @@ class LGBot:
         self.min_price = c["priceMin"]
         self.max_price = c["priceMax"]
         self.dp_percent = c["dpPercent"]
+        self.filter_by_price = c.get("filterByPrice", True)
+        self.filter_by_dp = c.get("filterByDp", True)
+        self.serial_numbers = set(c.get("serialNumbers", []))
         self.scan_interval = max(0.5, c.get("scanInterval", 2000) / 1000.0)
         self.email = c.get("email", "")
         self.app_password = c.get("appPassword", "")
         _log("info", f"Profile: {c['name']} | URL: {self.url}")
-        _log("info", f"Price range: ₹{self.min_price}–₹{self.max_price} | DP ≥ {self.dp_percent}%")
+        _log("info", f"Price: {'ON' if self.filter_by_price else 'OFF'} ₹{self.min_price}–₹{self.max_price} | DP: {'ON' if self.filter_by_dp else 'OFF'} ≥ {self.dp_percent}%")
+        if self.serial_numbers:
+            _log("info", f"Serial filter: {len(self.serial_numbers)} serial(s) exact match")
         _log("info", f"Scan: {self.scan_interval}s | Email: {self.email or 'none'}")
 
     def _send_kpi(self, response_time_ms: int) -> None:
@@ -298,9 +306,6 @@ class LGBot:
         return "ok"
 
     def _filter_inventory(self, inventory: list[dict]) -> list[dict]:
-        if self.min_price is None and self.max_price is None and self.dp_percent is None:
-            return inventory
-
         def price(s: str) -> float:
             return float(s.replace(",", "").strip()) if s.strip() else 0.0
 
@@ -309,17 +314,27 @@ class LGBot:
 
         filtered = []
         for r in inventory:
-            p = price(r["dealer_price"])
-            d = dp(r["dp"])
-            if self.min_price is not None and p < self.min_price:
-                _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{r['dealer_price']} < min ₹{self.min_price}")
+            # Serial number exact-match filter (when list is non-empty, only match those serials)
+            if self.serial_numbers and r["serial_no"] not in self.serial_numbers:
                 continue
-            if self.max_price is not None and p > self.max_price:
-                _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{r['dealer_price']} > max ₹{self.max_price}")
-                continue
-            if self.dp_percent is not None and d < self.dp_percent:
-                _log("scan", f"Reject {r['serial_no'][:15]}: DP {d}% < {self.dp_percent}%")
-                continue
+
+            # Price filter (only when toggled ON)
+            if self.filter_by_price:
+                p = price(r["dealer_price"])
+                if self.min_price is not None and p < self.min_price:
+                    _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{r['dealer_price']} < min ₹{self.min_price}")
+                    continue
+                if self.max_price is not None and p > self.max_price:
+                    _log("scan", f"Reject {r['serial_no'][:15]}: price ₹{r['dealer_price']} > max ₹{self.max_price}")
+                    continue
+
+            # Discount % filter (only when toggled ON)
+            if self.filter_by_dp:
+                d = dp(r["dp"])
+                if self.dp_percent is not None and d < self.dp_percent:
+                    _log("scan", f"Reject {r['serial_no'][:15]}: DP {d}% < {self.dp_percent}%")
+                    continue
+
             filtered.append(r)
         return filtered
 
